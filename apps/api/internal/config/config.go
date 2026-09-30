@@ -87,7 +87,7 @@ type CircuitBreakerConfig struct {
 	openDuration time.Duration
 
 	sorobanRPCOverride breakerOverride
-	horizonOverride     breakerOverride
+	horizonOverride    breakerOverride
 }
 
 // breakerOverride holds per-upstream threshold overrides. A nil pointer field
@@ -314,6 +314,14 @@ type RateLimitConfig struct {
 	rebalanceWindow time.Duration
 	authLimit       int
 	authWindow      time.Duration
+	// Per-API-key limit (nester#1343), distinct from globalLimit/globalWindow
+	// which bound request rate per client IP. A single compromised or
+	// misbehaving integration holding the shared service API key can
+	// otherwise exhaust the IP-based budget for every other client sharing
+	// that address (e.g. several integrations behind one NAT gateway, or one
+	// bursty integration crowding out the rest on the same key).
+	apiKeyLimit  int
+	apiKeyWindow time.Duration
 	// Auth-failure lockout (nester#1104). Distinct from authLimit/authWindow,
 	// which bound request *rate*; these bound repeated *failures* and escalate
 	// a backoff the attacker cannot outrun by slowing down.
@@ -425,6 +433,14 @@ func Load() (*Config, error) {
 			rebalanceWindow: loader.durationDefault("RATELIMIT_REBALANCE_WINDOW", 1*time.Hour),
 			authLimit:       loader.intDefault("RATELIMIT_AUTH_LIMIT", 10),
 			authWindow:      loader.durationDefault("RATELIMIT_AUTH_WINDOW", 1*time.Minute),
+			// Deliberately tighter than globalLimit (300 vs. 100 req/min per
+			// IP): the API key is shared across every caller presenting it,
+			// so its own budget must be generous enough for legitimate
+			// multi-integration traffic while still capping any one key's
+			// total blast radius independent of how many distinct IPs it is
+			// used from.
+			apiKeyLimit:  loader.intDefault("RATELIMIT_APIKEY_LIMIT", 300),
+			apiKeyWindow: loader.durationDefault("RATELIMIT_APIKEY_WINDOW", 1*time.Minute),
 			// 5 failures in 15 minutes starts the backoff. A legitimate user
 			// retrying a flaky wallet signature stays well under it; a
 			// signature brute-force does not.
@@ -1175,6 +1191,14 @@ func (c *Config) validate(loader *envLoader) {
 	} else if c.rateLimit.authWindow < time.Millisecond {
 		loader.addError("RATELIMIT_AUTH_WINDOW must be at least 1ms")
 	}
+	if c.rateLimit.apiKeyLimit <= 0 {
+		loader.addError("RATELIMIT_APIKEY_LIMIT must be greater than 0")
+	}
+	if c.rateLimit.apiKeyWindow <= 0 {
+		loader.addError("RATELIMIT_APIKEY_WINDOW must be greater than 0")
+	} else if c.rateLimit.apiKeyWindow < time.Millisecond {
+		loader.addError("RATELIMIT_APIKEY_WINDOW must be at least 1ms")
+	}
 	if c.rateLimit.authFailureThreshold <= 0 {
 		loader.addError("AUTH_FAILURE_THRESHOLD must be greater than 0")
 	}
@@ -1495,6 +1519,16 @@ func (r RateLimitConfig) AuthLimit() int {
 
 func (r RateLimitConfig) AuthWindow() time.Duration {
 	return r.authWindow
+}
+
+// APIKeyLimit is the per-API-key request budget (nester#1343), independent
+// of and in addition to GlobalLimit's per-IP budget.
+func (r RateLimitConfig) APIKeyLimit() int {
+	return r.apiKeyLimit
+}
+
+func (r RateLimitConfig) APIKeyWindow() time.Duration {
+	return r.apiKeyWindow
 }
 
 // AuthFailureThreshold is how many failures inside AuthFailureWindow are
