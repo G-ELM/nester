@@ -225,6 +225,85 @@ fn test_no_performance_fee_on_loss() {
 }
 
 // ---------------------------------------------------------------------------
+// Time-locked savings vault (issue #802)
+// ---------------------------------------------------------------------------
+
+/// Full lock lifecycle across the real multi-contract harness: deposit_locked
+/// → yield report → mature → unlock_position → withdraw. Confirms the boost
+/// mechanism (unit-tested against the bare VaultContract in
+/// contracts/vault/src/test.rs) also holds end-to-end through the same
+/// vault ↔ vault_token cross-contract path every other lifecycle test here
+/// exercises, and that a matured lock's shares really do become ordinary,
+/// withdrawable flexible shares afterward.
+#[test]
+fn test_locked_deposit_yield_mature_unlock_withdraw() {
+    let h = NesterHarness::setup();
+    let locked_user = h.create_user();
+    let flexible_user = h.create_user();
+    configure_fees(&h);
+    disable_circuit_breaker(&h);
+
+    const LOCK_DURATION_SECS: u64 = 90 * 86_400;
+
+    h.mint_deposit_tokens(&locked_user, DEPOSIT);
+    h.mint_deposit_tokens(&flexible_user, DEPOSIT);
+
+    let lock_id = h
+        .vault()
+        .deposit_locked(&locked_user, &DEPOSIT, &0, &LOCK_DURATION_SECS);
+    h.vault().deposit(&flexible_user, &DEPOSIT, &0);
+
+    // Locked shares count toward the balance but cannot be withdrawn as
+    // flexible shares while the lock is open.
+    assert_eq!(h.vault().get_balance(&locked_user), DEPOSIT);
+    let blocked = h.vault().try_withdraw(&locked_user, &1, &0);
+    assert!(
+        blocked.is_err(),
+        "withdraw must reject shares still committed to an open lock"
+    );
+
+    // Report yield and let it fully vest (issue #803's 24h default window).
+    h.mint_deposit_tokens(&h.vault_id, YIELD_AMOUNT);
+    h.vault().grant_role(&h.admin, &h.admin, &Role::Manager);
+    h.vault().report_yield(&h.admin, &YIELD_AMOUNT);
+    h.env.ledger().with_mut(|l| l.timestamp = 86_401);
+    h.vault().report_yield(&h.admin, &0);
+
+    let view = h.vault().get_locked_positions(&locked_user);
+    assert_eq!(view.positions.len(), 1);
+    let position = view.positions.get(0).unwrap();
+    assert!(
+        position.shares > DEPOSIT,
+        "the locked position must have been minted extra boost shares from the yield report"
+    );
+
+    // Mature the lock, then unlock — shares move into the flexible balance.
+    h.env
+        .ledger()
+        .with_mut(|l| l.timestamp += LOCK_DURATION_SECS + 1);
+    let unlocked_shares = h.vault().unlock_position(&locked_user, &lock_id);
+    assert_eq!(unlocked_shares, position.shares);
+    assert_eq!(
+        h.vault().get_locked_positions(&locked_user).positions.len(),
+        0
+    );
+
+    // Now an ordinary flexible withdrawal works for the full (boosted) balance.
+    let remaining = h.vault().withdraw(&locked_user, &unlocked_shares, &0);
+    assert_eq!(
+        remaining, 0,
+        "all shares should be burned after full withdrawal"
+    );
+
+    let user_usdc = token::Client::new(&h.env, &h.deposit_token_id).balance(&locked_user);
+    assert!(
+        user_usdc > DEPOSIT,
+        "the locked depositor must come out ahead of their own principal after the boost: got {}",
+        user_usdc
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Upgrade Framework Integration Tests
 // ---------------------------------------------------------------------------
 

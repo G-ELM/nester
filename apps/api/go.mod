@@ -2,8 +2,6 @@ module github.com/suncrestlabs/nester/apps/api
 
 go 1.25.14
 
-toolchain go1.25.14
-
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/exaring/otelpgx v0.11.1

@@ -115,6 +115,7 @@ var authzMatrix = []AuthzRoute{
 	{Method: "GET", Path: "/api/v1/yields/00000000-0000-0000-0000-000000000000", Public: true},
 	{Method: "GET", Path: "/api/v1/yield-opportunities", Public: true},
 	{Method: "GET", Path: "/api/v1/yield-opportunities/compare", Public: true},
+	{Method: "GET", Path: "/api/v1/yield-opportunities/compare-all", Public: true},
 
 	// ── Money-path pause switches (#1120) ──────────────────────────────
 	{Method: "GET", Path: "/api/v1/admin/money-path/switches", RequireRole: "admin"},

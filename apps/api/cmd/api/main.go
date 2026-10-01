@@ -832,18 +832,31 @@ func run() error {
 	depHTTPClient := &http.Client{Timeout: cfg.Startup().DependencyTimeout()}
 
 	healthDependencies := healthDeps{
-		ready:        &ready,
-		pingDB:       pgPool.Ping,
-		poolStats:    pgxPoolStats(pgPool),
-		probeTimeout: cfg.Database().ConnectionTimeout(),
-		httpClient:   depHTTPClient,
-		horizonURL:   cfg.Stellar().HorizonURL(),
-		rpcURL:       cfg.Stellar().RPCURL(),
-		startedAt:    startedAt,
-		environment:  cfg.Environment(),
-		buildVersion: version,
-		buildCommit:  buildCommit(),
-		breakers:     chainBreakers.readers(),
+		ready:           &ready,
+		pingDB:          pgPool.Ping,
+		poolStats:       pgxPoolStats(pgPool),
+		probeTimeout:    cfg.Database().ConnectionTimeout(),
+		httpClient:      depHTTPClient,
+		horizonURL:      cfg.Stellar().HorizonURL(),
+		rpcURL:          cfg.Stellar().RPCURL(),
+		startedAt:       startedAt,
+		environment:     cfg.Environment(),
+		buildVersion:    version,
+		buildCommit:     buildCommit(),
+		breakers:        chainBreakers.readers(),
+		freshnessReader: indexerFreshness,
+		// Readiness gets its own probe rather than reusing the breaker-wrapped
+		// clients built for the invokers below: a health check is a
+		// diagnostic, and an open breaker must not be able to report RPC as
+		// unreachable when it has in fact recovered (see the comment on
+		// healthDeps.breakers).
+		pingRPC: func(ctx context.Context) error {
+			result := stellarpkg.PingSorobanRPC(ctx, depHTTPClient, cfg.Stellar().RPCURL())
+			if !result.OK {
+				return errors.New(result.Error)
+			}
+			return nil
+		},
 	}
 	// Left nil when Redis is unconfigured, so readiness does not fail an
 	// instance that is deliberately running on the in-memory fallbacks.
@@ -887,6 +900,17 @@ func run() error {
 	projectionHandler.Register(mux)
 	analyticsHandler := handler.NewAnalyticsHandler(performanceService)
 	analyticsHandler.Register(mux)
+
+	// Protocol-level yield comparison over time (#1324).
+	protocolComparisonRepo := postgres.NewAnalyticsComparisonRepository(db)
+	protocolComparisonService := service.NewProtocolComparisonService(protocolComparisonRepo)
+	protocolComparisonHandler := handler.NewProtocolComparisonHandler(protocolComparisonService)
+	protocolComparisonHandler.Register(mux)
+
+	// System-wide maintenance mode (#1328): halt or read-only, gated to admins.
+	maintenanceHandler := handler.NewMaintenanceHandler(systemStateRepository)
+	maintenanceHandler.Register(mux)
+	maintenanceGate := middleware.NewMaintenanceGate(systemStateRepository, 5*time.Second)
 
 	// Risk service
 	riskService := services.NewRiskService(vaultRepository, db)
@@ -1201,6 +1225,10 @@ func run() error {
 	// there would only ever enqueue jobs for Email/Push that it has no
 	// adapter to actually redeliver.
 	notificationDispatcher2.SetRetryEnqueuer(notifications.NewJobQueueRetryEnqueuer(jobQueueClient))
+
+	// Dead-letter inspection and manual retry (#1329), gated to admins.
+	jobQueueAdminHandler := handler.NewJobQueueAdminHandler(jobQueueRepo)
+	jobQueueAdminHandler.Register(mux)
 
 	// Recurring deposit sweep (#846): classified SINGLETON (money-moving —
 	// see RecurringDepositJob's doc comment). The sweep loop itself only
@@ -1631,16 +1659,18 @@ func run() error {
 									authGuard(
 										writeLimiter(
 											authenticator(
-												walletBinding(
-													idempotencyMiddleware(
-														costQuota(
-															walletLimiter(
-																middleware.LimitRequestBody(1 * 1024 * 1024)(
-																	middleware.Logging(baseLogger)(
-																		middleware.Tracing(
-																			cfg.Tracing().ServiceName(),
-																			cfg.Tracing().LatencyThreshold(),
-																		)(mux),
+												maintenanceGate.Middleware(authRules)(
+													walletBinding(
+														idempotencyMiddleware(
+															costQuota(
+																walletLimiter(
+																	middleware.LimitRequestBody(1 * 1024 * 1024)(
+																		middleware.Logging(baseLogger)(
+																			middleware.Tracing(
+																				cfg.Tracing().ServiceName(),
+																				cfg.Tracing().LatencyThreshold(),
+																			)(mux),
+																		),
 																	),
 																),
 															),
@@ -2100,6 +2130,34 @@ type healthDeps struct {
 	// "reachable, but breaker still open" is exactly what tells an operator
 	// recovery is one probe away.
 	breakers map[metrics.Upstream]*breaker.Breaker
+
+	// freshnessReader backs the readiness staleness gate (nester#1107). It is
+	// the same freshness.Tracker the indexer publishes to and the API
+	// freshness headers read, so /readyz can never disagree with what a
+	// response's own X-Indexer-Stale header says. nil means no reader was
+	// wired (a build that never started the indexer, or a test that does not
+	// care about this axis), and indexerStale treats that as "not stale"
+	// rather than pulling every such instance out of rotation.
+	freshnessReader freshness.Reader
+
+	// pingRPC probes Soroban RPC for readiness (nester#1107). Unlike
+	// pingRedis, this is never nil in production — the API cannot serve a
+	// single deposit or withdrawal route without RPC — so, unlike Redis, its
+	// absence is not treated as "not configured" and skipped; readinessHandler
+	// requires it to be set.
+	pingRPC healthProbe
+}
+
+// indexerStale reports whether the indexed view is beyond its staleness
+// budget. A nil reader — no freshness tracker wired — is reported as not
+// stale rather than unknown: readiness has no positive evidence of staleness
+// to act on, and failing every such instance closed would turn a missing
+// collector into an outage instead of the diagnostic gap it actually is.
+func indexerStale(reader freshness.Reader) bool {
+	if reader == nil {
+		return false
+	}
+	return reader.Snapshot().Stale
 }
 
 // registerHealthRoutes wires the liveness, readiness, and diagnostic health
@@ -2124,12 +2182,23 @@ func registerHealthRoutes(mux *http.ServeMux, deps healthDeps) {
 // readinessHandler reports whether this instance should be sent traffic.
 //
 // It fails closed on every dependency the instance cannot serve correct
-// responses without: PostgreSQL, and — when configured — Redis, which backs
-// the token-revocation cache and the distributed rate limiters, so an instance
-// that has lost it would honour revoked sessions and under-count limits. A
-// pool that is saturated rather than down surfaces identically: the ping
-// blocks waiting for a free connection and probeTimeout turns that into a
-// failure.
+// responses without: PostgreSQL; Redis, when configured, which backs the
+// token-revocation cache and the distributed rate limiters, so an instance
+// that has lost it would honour revoked sessions and under-count limits;
+// Soroban RPC, without which no deposit, withdrawal, or vault route can
+// complete (nester#1107); and the indexed view's own staleness budget, since
+// an instance serving balances it knows are stale should not be the one
+// taking traffic either. A pool that is saturated rather than down surfaces
+// identically to a hard failure: the ping blocks waiting for a free
+// connection and probeTimeout turns that into one.
+//
+// Horizon is deliberately not part of this list — see detailedHealthHandler's
+// "degraded" branch, which is where Horizon and (redundantly) Soroban RPC
+// outages are reported without evicting the instance from rotation for a
+// dependency degradation this handler treats as fatal to the whole instance.
+// The two checks answer different questions: detailedHealthHandler asks
+// "what, if anything, is wrong", readinessHandler asks "should this instance
+// receive traffic at all".
 func readinessHandler(deps healthDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -2157,6 +2226,21 @@ func readinessHandler(deps healthDeps) http.HandlerFunc {
 				_, _ = w.Write([]byte("redis unavailable"))
 				return
 			}
+		}
+		if deps.pingRPC != nil {
+			rpcCtx, rpcCancel := context.WithTimeout(r.Context(), deps.probeTimeout)
+			rpcErr := deps.pingRPC(rpcCtx)
+			rpcCancel()
+			if rpcErr != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("soroban rpc unavailable"))
+				return
+			}
+		}
+		if indexerStale(deps.freshnessReader) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("indexer stale"))
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

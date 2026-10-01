@@ -295,7 +295,10 @@ func (d *APYDriftDetector) evaluateAndEnqueue(ctx context.Context, v vault.Vault
 	// in-flight guard would just reject anyway.
 	idempotencyKey := fmt.Sprintf("apy-drift:%s:%s", v.ID, payload.DetectedAt.Format("2006-01-02"))
 
-	job, err := d.jobs.EnqueueJSON(ctx, RebalanceDriftJobType, payload, jobqueue.WithIdempotencyKey(idempotencyKey))
+	job, err := d.jobs.EnqueueJSON(ctx, RebalanceDriftJobType, payload,
+		jobqueue.WithIdempotencyKey(idempotencyKey),
+		jobqueue.WithPriority(jobqueue.PriorityBalance),
+	)
 	if err != nil {
 		d.logger.Error("apy drift: enqueue rebalance job failed",
 			"vault_id", v.ID, "optimal_protocol", decision.OptimalProtocol, "error", err)
