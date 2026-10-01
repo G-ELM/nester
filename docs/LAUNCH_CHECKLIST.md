@@ -27,6 +27,7 @@ This document defines the strict, mandatory checklist required for the Nester ma
   - Prometheus scraping, Grafana dashboards, and alert receivers (PagerDuty / Slack / webhooks) are fully deployed and operational for mainnet endpoints.
   - Synthetic probes (`synthetic-probes.yml`) and critical SLO alerts (`SLOTargetDown`, error budget burn rates, high latency) are verified and firing correctly in staging.
   - Metrics listeners and ledger/event indexer lag tracking are active.
+  - The [30-day heightened-monitoring plan](POST_LAUNCH_MONITORING.md) is staffed with a named daily-reviewer rota for Day 0–30.
 
 - [ ] **4. Runbooks Written**
   - All operational runbooks under `docs/observability/runbooks/` (including API availability, database failover, monitoring down, and incident response) are reviewed and tested in staging drills.
