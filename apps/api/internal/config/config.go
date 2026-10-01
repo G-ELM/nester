@@ -35,35 +35,36 @@ const maxKeyVersionLen = 32
 const maxDatabasePoolSize = 10000
 
 type Config struct {
-	environment          string
-	server               ServerConfig
-	database             DatabaseConfig
-	stellar              StellarConfig
-	allocation           AllocationConfig
-	redis                RedisConfig
-	auth                 AuthConfig
-	rateLimit            RateLimitConfig
-	log                  LogConfig
-	allowedOrigins       []string
-	performance          PerformanceConfig
-	tvl                  TVLConfig
-	apyRefresh           APYRefreshConfig
-	startup              StartupConfig
-	bankAccountCipherKey string
-	accountCipher        AccountCipherConfig
-	transactionPoller    TransactionPollerConfig
-	reconciliation       ReconciliationConfig
-	recurringDeposit     RecurringDepositConfig
-	jobQueue             JobQueueConfig
-	outbox               OutboxConfig
-	harvest              HarvestConfig
-	rebalancer           RebalancerConfig
-	schedulerLeadership  SchedulerLeadershipConfig
-	tracing              TracingConfig
-	metrics              MetricsConfig
-	indexer              IndexerConfig
-	circuitBreaker       CircuitBreakerConfig
-	rpcRetry             RPCRetryConfig
+	environment            string
+	server                 ServerConfig
+	database               DatabaseConfig
+	stellar                StellarConfig
+	allocation             AllocationConfig
+	redis                  RedisConfig
+	auth                   AuthConfig
+	rateLimit              RateLimitConfig
+	log                    LogConfig
+	allowedOrigins         []string
+	performance            PerformanceConfig
+	tvl                    TVLConfig
+	apyRefresh             APYRefreshConfig
+	startup                StartupConfig
+	bankAccountCipherKey   string
+	accountCipher          AccountCipherConfig
+	transactionPoller      TransactionPollerConfig
+	reconciliation         ReconciliationConfig
+	recurringDeposit       RecurringDepositConfig
+	jobQueue               JobQueueConfig
+	outbox                 OutboxConfig
+	harvest                HarvestConfig
+	rebalancer             RebalancerConfig
+	goalNotificationDigest GoalNotificationDigestConfig
+	schedulerLeadership    SchedulerLeadershipConfig
+	tracing                TracingConfig
+	metrics                MetricsConfig
+	indexer                IndexerConfig
+	circuitBreaker         CircuitBreakerConfig
+	rpcRetry               RPCRetryConfig
 }
 
 // CircuitBreakerConfig is the policy protecting the chain upstreams, Soroban
@@ -87,7 +88,7 @@ type CircuitBreakerConfig struct {
 	openDuration time.Duration
 
 	sorobanRPCOverride breakerOverride
-	horizonOverride     breakerOverride
+	horizonOverride    breakerOverride
 }
 
 // breakerOverride holds per-upstream threshold overrides. A nil pointer field
@@ -530,6 +531,10 @@ func Load() (*Config, error) {
 			// throughout the scheduler package.
 			apyDriftThresholdBPS: int64(loader.intDefault("REBALANCE_APY_THRESHOLD", 200)),
 		},
+		goalNotificationDigest: GoalNotificationDigestConfig{
+			enabled:  loader.boolDefault("GOAL_NOTIFICATION_DIGEST_ENABLED", true),
+			interval: loader.durationDefault("GOAL_NOTIFICATION_DIGEST_INTERVAL", time.Hour),
+		},
 		schedulerLeadership: SchedulerLeadershipConfig{
 			lockKey:           int64(loader.intDefault("SCHEDULER_LEADER_LOCK_KEY", 846000)),
 			heartbeatInterval: loader.durationDefault("SCHEDULER_LEADER_HEARTBEAT_INTERVAL", 3*time.Second),
@@ -955,6 +960,20 @@ func (r RebalancerConfig) MinAPYGainBPS() int64    { return r.minAPYGainBPS }
 // basis points (REBALANCE_APY_THRESHOLD, default 200 = 2%), used by the
 // APYDriftDetector (#613).
 func (r RebalancerConfig) APYDriftThresholdBPS() int64 { return r.apyDriftThresholdBPS }
+
+// GoalNotificationDigestConfig governs the per-goal digest flush loop
+// (nester#1340): how often it checks for due preferences to flush. Previously
+// hardcoded in main.go with no env var to tune it.
+type GoalNotificationDigestConfig struct {
+	enabled  bool
+	interval time.Duration
+}
+
+func (c Config) GoalNotificationDigest() GoalNotificationDigestConfig {
+	return c.goalNotificationDigest
+}
+func (g GoalNotificationDigestConfig) Enabled() bool           { return g.enabled }
+func (g GoalNotificationDigestConfig) Interval() time.Duration { return g.interval }
 
 // SchedulerLeadershipConfig governs the Postgres-advisory-lock leader
 // election that gates all five scheduler background job loops (#846). See
