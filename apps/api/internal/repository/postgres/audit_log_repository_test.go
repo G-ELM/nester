@@ -12,7 +12,7 @@ import (
 )
 
 // TestPostgresAuditLoggerLog_WritesCorrelationID covers nester#1339: the
-// insert must include correlation_id (migration 122) alongside the
+// insert must include correlation_id (migration 123) alongside the
 // pre-existing columns, and a non-empty CorrelationID must reach the
 // database as itself, not silently dropped.
 func TestPostgresAuditLoggerLog_WritesCorrelationID(t *testing.T) {
