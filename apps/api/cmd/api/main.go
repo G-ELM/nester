@@ -1671,6 +1671,17 @@ func run() error {
 		middleware.NewLimiter(redisClient, "global", cfg.RateLimit().GlobalLimit(), cfg.RateLimit().GlobalWindow()),
 		[]string{"/health", "/healthz", "/readyz", "/metrics"},
 	)
+	// apiKeyLimiter bounds every request per bearer credential (nester#1343),
+	// independent of globalLimiter's per-IP budget -- a single compromised or
+	// misbehaving integration holding the shared service API key cannot
+	// exhaust the IP-based budget for other clients on the same address, and
+	// cannot evade its own limit by rotating source IPs. Requests with no
+	// bearer token (anonymous, or JWT-authenticated -- those already get
+	// per-user isolation elsewhere) pass through untouched.
+	apiKeyLimiter := middleware.APIKeyRateLimiter(
+		middleware.NewLimiter(redisClient, "apikey", cfg.RateLimit().APIKeyLimit(), cfg.RateLimit().APIKeyWindow()),
+		[]string{"/health", "/healthz", "/readyz", "/metrics"},
+	)
 	// authRouteLimiter applies a strict per-IP limit to the unauthenticated auth
 	// handshake to blunt credential-stuffing. Keyed by IP because no user exists
 	// yet at challenge/verify time.
@@ -1806,24 +1817,26 @@ func run() error {
 						// indexed data is.
 						middleware.IndexerFreshness(indexerFreshness)(
 							globalLimiter(
-								authRouteLimiter(
-									// Inside the per-IP limiter so an already
-									// rate-limited request never reaches the
-									// lockout bookkeeping (nester#1104).
-									authGuard(
-										writeLimiter(
-											authenticator(
-												maintenanceGate.Middleware(authRules)(
-													walletBinding(
-														idempotencyMiddleware(
-															costQuota(
-																walletLimiter(
-																	middleware.LimitRequestBody(1 * 1024 * 1024)(
-																		middleware.Logging(baseLogger)(
-																			middleware.Tracing(
-																				cfg.Tracing().ServiceName(),
-																				cfg.Tracing().LatencyThreshold(),
-																			)(mux),
+								apiKeyLimiter(
+									authRouteLimiter(
+										// Inside the per-IP limiter so an already
+										// rate-limited request never reaches the
+										// lockout bookkeeping (nester#1104).
+										authGuard(
+											writeLimiter(
+												authenticator(
+													maintenanceGate.Middleware(authRules)(
+														walletBinding(
+															idempotencyMiddleware(
+																costQuota(
+																	walletLimiter(
+																		middleware.LimitRequestBody(1 * 1024 * 1024)(
+																			middleware.Logging(baseLogger)(
+																				middleware.Tracing(
+																					cfg.Tracing().ServiceName(),
+																					cfg.Tracing().LatencyThreshold(),
+																				)(mux),
+																			),
 																		),
 																	),
 																),
