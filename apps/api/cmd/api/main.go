@@ -1266,7 +1266,10 @@ func run() error {
 	savingsGoalHandler.Register(mux)
 
 	goalNotificationDigestJob := scheduler.NewGoalNotificationDigestJob(
-		scheduler.GoalNotificationDigestConfig{Enabled: true, Interval: time.Hour},
+		scheduler.GoalNotificationDigestConfig{
+			Enabled:  cfg.GoalNotificationDigest().Enabled(),
+			Interval: cfg.GoalNotificationDigest().Interval(),
+		},
 		goalNotificationRepo,
 		notificationDispatcher2,
 		baseLogger.WithGroup("goal-notification-digest"),
