@@ -26,6 +26,12 @@ var (
 	ErrTooFewEntries      = errors.New("at least two entries required")
 	ErrEmptyTransactionID = errors.New("transaction_id is required")
 	ErrZeroAmount         = errors.New("amount must be non-zero")
+	// ErrAlreadyPosted is returned by PostEntries/PostEntriesTx when the same
+	// domain event (domain_event_type + domain_event_id) has already been
+	// posted. Callers should treat this as a no-op success rather than a
+	// hard failure, since it means a retried request found its postings
+	// already applied (nester#1309).
+	ErrAlreadyPosted = errors.New("ledger entries already posted for this domain event")
 )
 
 // ValidAccountTypes is the set of allowed account_type values.

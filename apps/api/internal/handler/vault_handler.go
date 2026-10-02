@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/suncrestlabs/nester/apps/api/internal/auth"
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/caps"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/moneypath"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
 	"github.com/suncrestlabs/nester/apps/api/internal/service"
@@ -750,7 +751,18 @@ func (h *VaultHandler) writeDomainError(w http.ResponseWriter, r *http.Request, 
 	case errors.Is(err, vault.ErrOperatorFundedDepositRefused):
 		response.WriteJSON(w, http.StatusForbidden,
 			response.Err(http.StatusForbidden, "OPERATOR_FUNDED_DEPOSIT_REFUSED", err.Error()))
+	// 403: the user is not in the current mainnet deposit allowlist cohort
+	// (nester#1389). The service is available; this specific user has not
+	// been granted access yet.
+	case errors.Is(err, vault.ErrDepositNotAllowlisted):
+		response.WriteJSON(w, http.StatusForbidden,
+			response.Err(http.StatusForbidden, "DEPOSIT_NOT_ALLOWLISTED", err.Error()))
 	case errors.Is(err, vault.ErrInsufficientBalance), errors.Is(err, vault.ErrVaultClosed), errors.Is(err, vault.ErrVaultNotActive):
+		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
+	// 400, not 500: the deposit is well-formed, it just would push this
+	// vault's mainnet TVL past the configured cap (nester#1376). The caller
+	// can act on this by depositing a smaller amount or waiting.
+	case errors.Is(err, caps.ErrTVLCapExceeded):
 		response.WriteJSON(w, http.StatusBadRequest, response.ValidationErr(err.Error()))
 
 	// The chain never gave us an answer: either the circuit breaker declined

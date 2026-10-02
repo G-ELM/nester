@@ -89,6 +89,11 @@ var (
 	// dedicated sentinel a cancellation would be classified as an internal
 	// failure and burn the error budget for something the system did right.
 	ErrUserCancelled = errors.New("attempt cancelled by user")
+	// ErrDepositNotAllowlisted is returned when the mainnet deposit allowlist
+	// gate is active and the user's ID has not been granted access (nester#1389).
+	// Maps to 403 at the handler layer — the service is available, the user is
+	// simply not in the current cohort.
+	ErrDepositNotAllowlisted = errors.New("your account is not yet enabled for deposits; join the waitlist")
 )
 
 const (
