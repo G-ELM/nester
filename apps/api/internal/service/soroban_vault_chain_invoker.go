@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/stellar/go/xdr"
+
+	"github.com/suncrestlabs/nester/apps/api/internal/costmonitor"
 	"github.com/suncrestlabs/nester/apps/api/internal/signing"
 	"github.com/suncrestlabs/nester/apps/api/internal/stellar"
 )
@@ -60,9 +63,20 @@ func NewSorobanVaultChainInvoker(
 	}, nil
 }
 
+// WithSubmissionPipeline enables idempotent, retry-safe submission for the
+// mutating vault operations below (deposit, withdraw, harvest, set-weights,
+func (s *SorobanVaultChainInvoker) WithSubmissionPipeline(pipeline *stellar.SubmissionPipeline) *SorobanVaultChainInvoker {
+	s.invoker.WithSubmissionPipeline(pipeline)
+	return s
+}
+
+// WithUsageTracking records Soroban RPC/Horizon call volume against tracker
+// — see stellar.ContractInvoker.WithUsageTracking.
+func (s *SorobanVaultChainInvoker) WithUsageTracking(tracker *costmonitor.Tracker) *SorobanVaultChainInvoker {
+	s.invoker.WithUsageTracking(tracker)
+	return s
 // SetHTTPClient replaces the HTTP client used for outbound chain calls. It
 // exists so startup can install the metrics-instrumented, circuit-broken
-// transport; a nil client is ignored so callers need not branch.
 //
 // The underlying invoker uses one client for both Soroban RPC and Horizon, so
 // this single client carries both upstreams. The breaker routes per request
@@ -90,7 +104,6 @@ func (s *SorobanVaultChainInvoker) SetRPCOptions(opts stellar.RPCOptions) {
 	s.invoker.SetRPCOptions(opts)
 }
 
-func (s *SorobanVaultChainInvoker) PauseVault(ctx context.Context, contractAddress string) error {
 	return s.invoker.InvokeVoidFunction(ctx, contractAddress, "pause")
 }
 

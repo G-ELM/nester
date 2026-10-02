@@ -1,4 +1,4 @@
-.PHONY: build build-adapters test integration-test fmt clippy clean help deploy-testnet
+.PHONY: build build-adapters test integration-test mainnet-fork-fetch mainnet-fork-test fmt clippy clean help deploy-testnet
 
 # Yield source adapters (#812). Each external protocol gets one small adapter
 # implementing nester_common::adapters::YieldAdapter. Adding a third protocol
@@ -12,6 +12,8 @@ help:
 	@echo "make build-adapters   - Build only the yield source adapters"
 	@echo "make test             - Run all unit tests"
 	@echo "make integration-test - Run multi-contract integration tests only"
+	@echo "make mainnet-fork-fetch - Fetch real Blend/Soroswap WASM for fork tests"
+	@echo "make mainnet-fork-test  - Run adapter tests against the real fetched WASM"
 	@echo "make fmt              - Format code with cargo fmt"
 	@echo "make clippy           - Run clippy linter (must pass clean)"
 	@echo "make clean            - Remove build artifacts"
@@ -49,6 +51,15 @@ integration-test:
 	@echo "Running multi-contract integration tests..."
 	@cargo test -p nester-integration-tests --lib
 	@echo "✓ Integration tests passed"
+
+mainnet-fork-fetch:
+	@echo "Fetching real Blend/Soroswap WASM for mainnet fork tests..."
+	@bash scripts/fetch-mainnet-fork.sh
+
+mainnet-fork-test:
+	@echo "Running adapter tests against real mainnet-fetched contract WASM..."
+	@NESTER_MAINNET_FORK=1 cargo test -p adapter-lending-contract -p adapter-pool-contract --lib
+	@echo "✓ Mainnet fork tests passed"
 
 fmt:
 	@echo "Formatting code..."

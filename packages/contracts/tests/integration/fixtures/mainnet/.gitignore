@@ -1,0 +1,5 @@
+# Fetched by scripts/fetch-mainnet-fork.sh — real mainnet bytecode, not
+# something to commit (it's large, binary, and goes stale the moment the
+# protocol redeploys). Fetch it locally before running the mainnet-fork
+# tests; see that script's header.
+*.wasm

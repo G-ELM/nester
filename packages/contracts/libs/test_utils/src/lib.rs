@@ -2,6 +2,7 @@ pub mod assertions;
 pub mod env;
 pub mod harness;
 pub mod hostile;
+pub mod mainnet_fork;
 pub mod mocks;
 
 pub use assertions::*;

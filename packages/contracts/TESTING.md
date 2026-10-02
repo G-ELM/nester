@@ -11,6 +11,7 @@ workspace.
 |------|----------|---------|
 | Unit tests | `contracts/*/src/` and `contracts/*/src/test.rs` | `make test` |
 | Integration tests | `tests/integration/src/integration/mod.rs` | `make integration-test` |
+| Mainnet fork tests | `contracts/adapter_{pool,lending}/src/mainnet_fork_test.rs` | `make mainnet-fork-test` |
 
 ---
 
@@ -25,7 +26,48 @@ make integration-test
 
 # Everything (unit + integration)
 cargo test --lib
+
+# Adapter tests against real, mainnet-fetched Blend/Soroswap WASM
+make mainnet-fork-fetch   # once, needs BLEND_POOL_CONTRACT_ID / SOROSWAP_PAIR_CONTRACT_ID
+make mainnet-fork-test
 ```
+
+---
+
+## Mainnet fork tests
+
+`contracts/adapter_pool/src/test.rs` and `contracts/adapter_lending/src/test.rs`
+run against `nester_test_utils::mocks::{MockAmmPool, MockLendingProtocol}` —
+deliberately simplified stand-ins for Soroswap and Blend. A mock can drift
+from the real protocol's behavior without any test noticing, which is a risk
+we specifically don't want to discover for the first time against mainnet.
+
+The mainnet fork tests close that gap by loading the **real, currently
+deployed** Soroswap pair / Blend pool WASM bytecode into the same in-process
+Soroban `Env`, fetched by `scripts/fetch-mainnet-fork.sh` via `stellar
+contract fetch`, and exercising it directly.
+
+They're opt-in and skip themselves (no `--ignored` needed) unless
+`NESTER_MAINNET_FORK=1` is set, so a plain `cargo test`/`make test` never
+needs network access, mainnet contract IDs, or the fetched fixtures:
+
+```bash
+export BLEND_POOL_CONTRACT_ID=C...       # a real Blend pool on mainnet
+export SOROSWAP_PAIR_CONTRACT_ID=C...    # a real Soroswap pair on mainnet
+make mainnet-fork-fetch
+make mainnet-fork-test
+```
+
+**Current finding:** `adapter_pool`'s fork test deploys the real SoroswapPair
+and documents that its single-asset `deposit(from, amount, min_units_out)`
+cannot drive the real pair's dual-asset, no-amount `deposit(to)` — see the
+comment in `contracts/adapter_pool/src/mainnet_fork_test.rs`. `adapter_lending`'s
+fork test is narrower (it only verifies the real Blend pool WASM loads)
+because a real pool can't be initialized standalone — it's normally deployed
+through Blend's `PoolFactoryContract` wired to a specific oracle, backstop,
+and reserve list. Fully exercising either fork — and fixing the adapters to
+match — is tracked as a pre-mainnet-launch blocker, not solved by this test
+suite alone.
 
 ---
 

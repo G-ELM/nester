@@ -244,3 +244,5 @@ fn require_vault(env: &Env, caller: &Address) {
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod mainnet_fork_test;

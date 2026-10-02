@@ -3,15 +3,21 @@ package stellar
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/stellar/go/keypair"
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
 	"go.opentelemetry.io/otel/trace"
 
@@ -19,6 +25,7 @@ import (
 	"github.com/stellar/go/txnbuild"
 	"github.com/stellar/go/xdr"
 
+	"github.com/suncrestlabs/nester/apps/api/internal/costmonitor"
 	"github.com/suncrestlabs/nester/apps/api/internal/telemetry"
 )
 
@@ -40,6 +47,18 @@ type ContractInvoker struct {
 	rpcURL            string
 	horizonURL        string
 	networkPassphrase string
+	kp                *keypair.Full
+	httpClient        *http.Client
+
+	// pipeline, when set via WithSubmissionPipeline, routes host-function
+	// submissions through SubmissionPipeline.SubmitIdempotent instead of
+	// the legacy one-shot path, so a client or network retry after an RPC
+	// timeout is deduped against the original attempt rather than sending
+	// a second on-chain transaction. nil preserves the original behavior
+	// (used by existing callers/tests that construct a ContractInvoker
+	// without a database).
+	pipeline    *SubmissionPipeline
+	retryPolicy RetryPolicy
 	// signer applies the operator signature. The invoker builds and simulates
 	// transactions but never holds key material itself — see signer.go and
 	// docs/security/signing-isolation.md.
@@ -79,6 +98,10 @@ func NewContractInvokerWithSigner(rpcURL, horizonURL, networkPassphrase string, 
 		rpcURL:            rpcURL,
 		horizonURL:        horizonURL,
 		networkPassphrase: networkPassphrase,
+		kp:                kp,
+		httpClient:        &http.Client{Timeout: 30 * time.Second},
+		retryPolicy:       DefaultRetryPolicy(),
+	}, nil
 		signer:            signer,
 		httpClient:        &http.Client{Timeout: defaultRPCTimeout},
 	}
@@ -145,6 +168,49 @@ func (c *ContractInvoker) SetRPCOptions(opts RPCOptions) {
 // calls would only add noise.
 func (c *ContractInvoker) rebuildRPC() {
 	c.rpc = newRPCClient(c.rpcURL, c.httpClient, c.rpcOpts, true)
+}
+
+// WithSubmissionPipeline enables idempotent, retry-safe submission for every
+// call that goes through submitHostFunction (deposit, withdraw, harvest,
+// set-allocation-weights, emergency-withdraw-all): a repeated call that
+// builds the identical host-function invocation for the same source account
+// is deduplicated against in-flight or completed chain submissions instead
+// of each sending its own transaction. See SubmissionPipeline.SubmitIdempotent.
+func (c *ContractInvoker) WithSubmissionPipeline(pipeline *SubmissionPipeline) *ContractInvoker {
+	c.pipeline = pipeline
+	return c
+}
+
+// WithRetryPolicy overrides the default policy used to decide how long an
+// unresolved submission is still treated as in-flight (see RetryPolicy).
+func (c *ContractInvoker) WithRetryPolicy(policy RetryPolicy) *ContractInvoker {
+	c.retryPolicy = policy
+	return c
+}
+
+// WithUsageTracking records one call per request this invoker makes —
+// Soroban RPC and Horizon alike, labeled separately by inspecting each
+// request's host — against tracker, so mainnet-scale RPC volume growth
+// shows up in costmonitor's daily budgets instead of only on an invoice.
+// Recording is fire-and-forget (see costmonitor.Tracker.RecordCallAsync):
+// it never adds latency to, or a new failure mode for, an actual RPC call.
+func (c *ContractInvoker) WithUsageTracking(tracker *costmonitor.Tracker) *ContractInvoker {
+	horizonHost := hostOf(c.horizonURL)
+	c.httpClient.Transport = costmonitor.WrapTransportFunc(tracker, "stellar_rpc", func(req *http.Request) string {
+		if req.URL.Host == horizonHost {
+			return "horizon"
+		}
+		return "soroban_rpc"
+	}, c.httpClient.Transport)
+	return c
+}
+
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // InvokeVoidFunction calls a contract function with signature (caller: Address).
@@ -1139,7 +1205,79 @@ func (c *ContractInvoker) invokeHostFunction(ctx context.Context, hostFn xdr.Hos
 	return c.waitForTx(ctx, hash)
 }
 
+// submitHostFunction submits hostFn as an InvokeHostFunction transaction.
+// When a submission pipeline is configured it goes through the idempotent,
+// retry-safe path (submitHostFunctionIdempotent); otherwise it falls back to
+// the original one-shot behavior (submitHostFunctionOnce) so existing
+// callers that construct a ContractInvoker without a database are
+// unaffected.
 func (c *ContractInvoker) submitHostFunction(ctx context.Context, hostFn xdr.HostFunction) (string, error) {
+	if c.pipeline == nil {
+		return c.submitHostFunctionOnce(ctx, hostFn)
+	}
+	return c.submitHostFunctionIdempotent(ctx, hostFn)
+}
+
+// submitHostFunctionIdempotent routes the submission through
+// SubmissionPipeline.SubmitIdempotent, keyed by a fingerprint of the source
+// account and the exact host-function invocation. A retry of the same call
+// (same contract, function and arguments, from the same operator account) —
+// whether triggered by a client, a job-queue redelivery, or two goroutines
+// racing — is detected and handed the in-flight or completed result instead
+// of signing and sending a second transaction.
+func (c *ContractInvoker) submitHostFunctionIdempotent(ctx context.Context, hostFn xdr.HostFunction) (string, error) {
+	fingerprint := c.idempotencyFingerprint(hostFn)
+
+	buildFn := func(seq int64) (string, string, error) {
+		return c.buildSignedHostFunctionTx(ctx, seq, hostFn)
+	}
+	sendFn := func(ctx context.Context, envelope string) (bool, error) {
+		if _, err := c.send(ctx, envelope); err != nil {
+			return isAmbiguousSubmitError(err), err
+		}
+		return false, nil
+	}
+
+	return c.pipeline.SubmitIdempotent(ctx, c.kp.Address(), fingerprint, "", nil, c.retryPolicy, buildFn, sendFn)
+}
+
+// idempotencyFingerprint derives a stable key for hostFn from the operator
+// account and the marshaled invocation itself, so retrying the exact same
+// call (e.g. the same withdraw request replayed after an RPC timeout)
+// always produces the same key, while a different call never collides with
+// an unrelated one.
+func (c *ContractInvoker) idempotencyFingerprint(hostFn xdr.HostFunction) string {
+	raw, err := xdr.MarshalBase64(hostFn)
+	if err != nil {
+		// Marshaling a HostFunction we just built should never fail; fall
+		// back to a fingerprint that can never match a prior attempt
+		// rather than blocking submission outright.
+		raw = uuid.New().String()
+	}
+	sum := sha256.Sum256([]byte(c.kp.Address() + "|" + raw))
+	return hex.EncodeToString(sum[:])
+}
+
+// isAmbiguousSubmitError reports whether err means we genuinely don't know
+// whether the RPC node received and will apply the transaction (a network
+// or context timeout), as opposed to a definitive rejection the node
+// responded with synchronously. Only the former is safe to leave as a
+// pending submission for later reconciliation — see SubmitIdempotent.
+func isAmbiguousSubmitError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return false
+}
+
+// submitHostFunctionOnce is the original, non-idempotent submission path:
+// fetch the current sequence, build, simulate, sign and send exactly once.
+// Used when no submission pipeline is configured.
+func (c *ContractInvoker) submitHostFunctionOnce(ctx context.Context, hostFn xdr.HostFunction) (string, error) {
 	operatorAddr, err := c.requireOperatorAddress()
 	if err != nil {
 		return "", err
@@ -1150,6 +1288,20 @@ func (c *ContractInvoker) submitHostFunction(ctx context.Context, hostFn xdr.Hos
 		return "", fmt.Errorf("get sequence number: %w", err)
 	}
 
+	signedB64, _, err := c.buildSignedHostFunctionTx(ctx, seq, hostFn)
+	if err != nil {
+		return "", err
+	}
+
+	return c.send(ctx, signedB64)
+}
+
+// buildSignedHostFunctionTx builds, simulates, fee-patches and signs an
+// InvokeHostFunction transaction for the given sequence number, returning
+// the signed envelope and its transaction hash computed locally — so the
+// hash is known even if the RPC send that follows times out.
+func (c *ContractInvoker) buildSignedHostFunctionTx(ctx context.Context, seq int64, hostFn xdr.HostFunction) (envelope, txHash string, err error) {
+	sourceAccount := txnbuild.NewSimpleAccount(c.kp.Address(), seq)
 	sourceAccount := txnbuild.NewSimpleAccount(operatorAddr, seq)
 
 	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
@@ -1164,52 +1316,58 @@ func (c *ContractInvoker) submitHostFunction(ctx context.Context, hostFn xdr.Hos
 		Preconditions: txnbuild.Preconditions{TimeBounds: txnbuild.NewTimeout(int64((5 * time.Minute).Seconds()))},
 	})
 	if err != nil {
-		return "", fmt.Errorf("build transaction: %w", err)
+		return "", "", fmt.Errorf("build transaction: %w", err)
 	}
 
 	txB64, err := tx.Base64()
 	if err != nil {
-		return "", fmt.Errorf("encode transaction: %w", err)
+		return "", "", fmt.Errorf("encode transaction: %w", err)
 	}
 
 	simResult, err := c.simulate(ctx, txB64)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	var sorobanData xdr.SorobanTransactionData
 	if err := xdr.SafeUnmarshalBase64(simResult.TransactionData, &sorobanData); err != nil {
-		return "", fmt.Errorf("decode soroban data: %w", err)
+		return "", "", fmt.Errorf("decode soroban data: %w", err)
 	}
 
-	envelope := tx.ToXDR()
-	envelope.V1.Tx.Ext = xdr.TransactionExt{
+	envelopeXDR := tx.ToXDR()
+	envelopeXDR.V1.Tx.Ext = xdr.TransactionExt{
 		V:           1,
 		SorobanData: &sorobanData,
 	}
 	minFee, err := strconv.ParseInt(simResult.MinResourceFee, 10, 64)
 	if err != nil {
-		return "", fmt.Errorf("parse simulation min resource fee %q: %w", simResult.MinResourceFee, err)
+		return "", "", fmt.Errorf("parse simulation min resource fee %q: %w", simResult.MinResourceFee, err)
 	}
-	envelope.V1.Tx.Fee = xdr.Uint32(txnbuild.MinBaseFee + minFee)
+	envelopeXDR.V1.Tx.Fee = xdr.Uint32(txnbuild.MinBaseFee + minFee)
 
-	envB64, err := xdr.MarshalBase64(envelope)
+	envB64, err := xdr.MarshalBase64(envelopeXDR)
 	if err != nil {
-		return "", fmt.Errorf("encode patched envelope: %w", err)
+		return "", "", fmt.Errorf("encode patched envelope: %w", err)
 	}
 
 	generic, err := txnbuild.TransactionFromXDR(envB64)
 	if err != nil {
-		return "", fmt.Errorf("parse patched tx: %w", err)
+		return "", "", fmt.Errorf("parse patched tx: %w", err)
 	}
 
 	inner, ok := generic.Transaction()
 	if !ok {
-		return "", errors.New("expected a transaction, got fee-bump")
+		return "", "", errors.New("expected a transaction, got fee-bump")
 	}
 
 	envelopeB64, err := inner.Base64()
 	if err != nil {
+		return "", "", fmt.Errorf("sign transaction: %w", err)
+	}
+
+	hashBytes, err := signed.Hash(c.networkPassphrase)
+	if err != nil {
+		return "", "", fmt.Errorf("compute tx hash: %w", err)
 		return "", fmt.Errorf("encode transaction for signing: %w", err)
 	}
 	signedB64, err := c.signEnvelope(ctx, SignRequest{
@@ -1218,10 +1376,11 @@ func (c *ContractInvoker) submitHostFunction(ctx context.Context, hostFn xdr.Hos
 		ContractAddress: hostFunctionContract(hostFn),
 	})
 	if err != nil {
+		return "", "", fmt.Errorf("encode signed transaction: %w", err)
 		return "", err
 	}
 
-	return c.send(ctx, signedB64)
+	return signedB64, hex.EncodeToString(hashBytes[:]), nil
 }
 
 func int64ToI128ScVal(n int64) xdr.ScVal {
