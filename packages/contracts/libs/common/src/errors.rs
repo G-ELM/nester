@@ -69,6 +69,19 @@ pub enum ContractError {
     AttestationExpired = 48,
     NonceReused = 49,
     ThresholdNotMet = 50,
+    // --- #802: Time-locked savings vault errors ---
+    // This enum is already at Soroban's hard cap of 50 error variants
+    // (stellar-xdr's ScSpecUdtErrorEnumV0.cases is VecM<_, 50>, enforced by
+    // #[contracterror] at compile time via a `.try_into().unwrap()` that
+    // panics with `LengthExceedsMax` past 50) — there is no room to add any
+    // more, contrary to what issue #802 itself asks for. Every new failure
+    // mode below is mapped onto the closest existing variant instead, same
+    // pattern as the #808/#804 reuse table above:
+    // LockNotMatured -> reuse TimelockNotReady (12)
+    // InvalidLockDuration -> reuse ConfigOutOfRange (19)
+    // LockNotFound -> reuse TimelockNotFound (14)
+    // InsufficientFlexibleShares -> reuse InsufficientBalance (4)
+    // LockLimitExceeded (per-user open-lock cap) -> reuse ExceedsLimit (10)
 }
 
 // Alias for backwards compatibility

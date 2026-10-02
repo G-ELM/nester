@@ -1191,3 +1191,105 @@ fn withdrawing_immediately_after_a_fully_vested_report_pays_out_the_full_amount(
         "a fully-vested report must be reflected in share price exactly like the pre-vesting instant-application model was"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Time-locked savings vault: adversarial scenarios (issue #802)
+// ---------------------------------------------------------------------------
+
+const LOCK_TIER_SECS: u64 = 30 * 86_400;
+
+#[test]
+fn breaking_a_lock_near_maturity_charges_a_much_smaller_penalty_than_breaking_immediately() {
+    // The linear decay is integer division on whole seconds, so breaking
+    // with only 1 second left out of a 30-day term floors to exactly zero
+    // bps (see contracts/vault/src/test.rs's
+    // break_lock_one_second_before_maturity_rounds_the_penalty_to_zero for
+    // the unit-level confirmation of that same floor). This test instead
+    // breaks with 1% of the term remaining, which is the smallest remaining
+    // fraction that still yields a nonzero, meaningfully decayed penalty —
+    // and confirms it, rather than a naive "1 second before maturity",
+    // actually demonstrates the decay end-to-end through the real harness.
+    // Two entirely separate harnesses (not two users sharing one vault) so
+    // that the baseline break's own penalty-retention (it stays in the
+    // vault and raises share price for remaining holders, by design) can
+    // never leak into the near-maturity scenario's own accounting.
+    let baseline_h = NesterHarness::setup();
+    let baseline_user = baseline_h.create_user();
+    baseline_h.mint_deposit_tokens(&baseline_user, 10_000_000);
+    let baseline_lock =
+        baseline_h
+            .vault()
+            .deposit_locked(&baseline_user, &10_000_000, &0, &LOCK_TIER_SECS);
+    let full_penalty_returned = baseline_h
+        .vault()
+        .break_lock(&baseline_user, &baseline_lock);
+    let full_penalty = 10_000_000 - full_penalty_returned;
+
+    let h = NesterHarness::setup();
+    let user = h.create_user();
+    h.mint_deposit_tokens(&user, 10_000_000);
+    let lock_id = h
+        .vault()
+        .deposit_locked(&user, &10_000_000, &0, &LOCK_TIER_SECS);
+
+    advance_time(&h, LOCK_TIER_SECS - LOCK_TIER_SECS / 100);
+    let near_maturity_returned = h.vault().break_lock(&user, &lock_id);
+    let near_maturity_penalty = 10_000_000 - near_maturity_returned;
+
+    assert!(
+        near_maturity_penalty > 0,
+        "penalty must still be nonzero this close to maturity"
+    );
+    assert!(
+        near_maturity_penalty < full_penalty,
+        "penalty near maturity ({near_maturity_penalty}) must have decayed well below the day-one penalty ({full_penalty})"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn opening_the_maximum_number_of_locks_rejects_the_next_one() {
+    let h = NesterHarness::setup();
+    let user = h.create_user();
+    // MAX_OPEN_LOCKS_PER_USER = 20 — mint enough for 21 dust-sized locks.
+    h.mint_deposit_tokens(&user, nester_common::MIN_DEPOSIT_AMOUNT * 21);
+
+    for _ in 0..20 {
+        h.vault().deposit_locked(
+            &user,
+            &nester_common::MIN_DEPOSIT_AMOUNT,
+            &0,
+            &LOCK_TIER_SECS,
+        );
+    }
+    // The 21st simultaneously open lock must be rejected by the per-user cap.
+    h.vault().deposit_locked(
+        &user,
+        &nester_common::MIN_DEPOSIT_AMOUNT,
+        &0,
+        &LOCK_TIER_SECS,
+    );
+}
+
+#[test]
+fn emergency_withdraw_exits_a_locked_position_when_paused() {
+    // Issue #802's explicit acceptance criterion: emergency paths ignore
+    // locks entirely. emergency_withdraw operates on the user's total
+    // (flexible + locked) vault_token balance with no lock-awareness at
+    // all, so a locked depositor must be able to exit in full through it
+    // even while the vault is paused and their lock has not matured.
+    let h = NesterHarness::setup();
+    let user = h.create_user();
+    h.mint_deposit_tokens(&user, 10_000_000);
+
+    h.vault()
+        .deposit_locked(&user, &10_000_000, &0, &LOCK_TIER_SECS);
+    h.vault().pause(&h.admin);
+
+    let returned = h.vault().emergency_withdraw(&user);
+    assert_eq!(
+        returned, 10_000_000,
+        "a locked position must exit in full through the emergency path, ignoring the lock and its unmatured status"
+    );
+    assert_eq!(h.vault().get_balance(&user), 0);
+}
