@@ -125,6 +125,11 @@ var (
 	// submitted (the signature was never provided), the same shape as every
 	// other "try again differently" case, not a server fault.
 	ErrUserCancelled error = apperror.NewValidation("VAULT_USER_CANCELLED", "attempt cancelled by user")
+	// ErrDepositNotAllowlisted is returned when the mainnet deposit allowlist
+	// gate is active and the user's ID has not been granted access (nester#1389).
+	// Kind is Forbidden: the service is available, the user is simply not in
+	// the current cohort.
+	ErrDepositNotAllowlisted error = apperror.NewForbidden("VAULT_DEPOSIT_NOT_ALLOWLISTED", "your account is not yet enabled for deposits; join the waitlist")
 )
 
 const (

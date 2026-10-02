@@ -34,6 +34,12 @@ var (
 	ErrTooFewEntries      error = apperror.NewValidation("LEDGER_TOO_FEW_ENTRIES", "at least two entries required")
 	ErrEmptyTransactionID error = apperror.NewValidation("LEDGER_EMPTY_TRANSACTION_ID", "transaction_id is required")
 	ErrZeroAmount         error = apperror.NewValidation("LEDGER_ZERO_AMOUNT", "amount must be non-zero")
+	// ErrAlreadyPosted is returned by PostEntries/PostEntriesTx when the same
+	// domain event (domain_event_type + domain_event_id) has already been
+	// posted. Callers should treat this as a no-op success rather than a
+	// hard failure, since it means a retried request found its postings
+	// already applied (nester#1309).
+	ErrAlreadyPosted error = apperror.NewConflict("LEDGER_ALREADY_POSTED", "ledger entries already posted for this domain event")
 )
 
 // ValidAccountTypes is the set of allowed account_type values.

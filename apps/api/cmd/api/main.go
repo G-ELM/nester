@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -33,6 +34,8 @@ import (
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/outbox"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/transaction"
 	"github.com/suncrestlabs/nester/apps/api/internal/domain/usersignal"
+	"github.com/suncrestlabs/nester/apps/api/internal/domain/vault"
+	"github.com/suncrestlabs/nester/apps/api/internal/flags"
 	"github.com/suncrestlabs/nester/apps/api/internal/freshness"
 	"github.com/suncrestlabs/nester/apps/api/internal/handler"
 	"github.com/suncrestlabs/nester/apps/api/internal/harvest"
@@ -111,9 +114,9 @@ func main() {
 // passphrase is never echoed into the log.
 func stellarNetworkLabel(passphrase string) string {
 	switch passphrase {
-	case "Public Global Stellar Network ; September 2015":
+	case config.StellarMainnetPassphrase:
 		return "pubnet"
-	case "Test SDF Network ; September 2015":
+	case config.StellarTestnetPassphrase:
 		return "testnet"
 	case "Test SDF Future Network ; October 2022":
 		return "futurenet"
@@ -304,6 +307,25 @@ func run() error {
 	// Deposit and withdrawal SLIs (nester#1056).
 	vaultService.SetMetrics(appMetrics)
 	vaultService.SetHarvestDefaultCompound(cfg.Stellar().HarvestDefaultCompound())
+	// Mainnet-only hard TVL cap per vault (nester#1376): never enforced off
+	// mainnet, and only enforced on mainnet when a positive cap is configured.
+	isMainnet := cfg.Stellar().NetworkPassphrase() == "Public Global Stellar Network ; September 2015"
+	tvlCap, err := decimal.NewFromString(cfg.Stellar().MainnetVaultTVLCap())
+	if err != nil {
+		return fmt.Errorf("parse STELLAR_MAINNET_VAULT_TVL_CAP: %w", err)
+	}
+	vaultService.SetTVLCapManager(service.NewMainnetTVLCapManager(isMainnet, tvlCap))
+	// Withdrawal circuit breaker (nester#1377): configurable threshold and
+	// window instead of the hardcoded default.
+	breakerThreshold, err := decimal.NewFromString(cfg.Stellar().WithdrawalBreakerThresholdPercent())
+	if err != nil {
+		return fmt.Errorf("parse WITHDRAWAL_BREAKER_THRESHOLD_PERCENT: %w", err)
+	}
+	vaultService.SetOutflowBreakerConfig(vault.OutflowBreakerConfig{
+		Enabled:          cfg.Stellar().WithdrawalBreakerEnabled(),
+		ThresholdPercent: breakerThreshold,
+		Window:           cfg.Stellar().WithdrawalBreakerWindow(),
+	})
 	vaultHandler := handler.NewVaultHandler(vaultService)
 
 	yieldHarvestRepository := postgres.NewYieldHarvestRepository(db)
@@ -545,6 +567,19 @@ func run() error {
 	sessionRepository := postgres.NewSessionRepository(db)
 	auditLogger := postgres.NewPostgresAuditLogger(db)
 	anomalyDetector := service.NoopAnomalyDetector{}
+
+	// Mainnet deposit allowlist gate (#1389): controlled rollout of mainnet
+	// deposits via a feature flag (cohort allowlist or percentage rollout).
+	// Fails closed — if the flag store is unreachable or the flag is
+	// unconfigured, deposits are blocked, not allowed (see
+	// FlagDepositAllowlistGate's RegisterFailSafe(..., false) call).
+	flagStore, err := flags.NewStore(db, flagAuditAdapter{auditLogger}, nil)
+	if err != nil {
+		baseLogger.Error("failed to initialize feature flag store", "error", err)
+		os.Exit(1)
+	}
+	flagEvaluator := flags.NewEvaluator(flagStore)
+	vaultService.SetDepositAllowlist(service.NewFlagDepositAllowlistGate(flagEvaluator))
 
 	// Issue #1141: support tooling to inspect a user's money-path state.
 	adminHandler.SetMoneyPathServices(portfolioService, transactionService, auditLogger)
@@ -1287,6 +1322,31 @@ func run() error {
 	defer cancelDataRetention()
 	go dataRetentionJob.Run(dataRetentionCtx, 24*time.Hour)
 
+	// Synthetic mainnet deposit/withdraw canary (#1390): probes a dedicated
+	// canary vault on a fixed schedule so an alert fires before users report
+	// problems. Disabled by default (CANARY_ENABLED) since it moves real
+	// funds; the invoker below is a stub that logs and errors rather than
+	// touching the chain — wiring a real on-chain probe implementation is
+	// tracked as a mainnet-launch follow-up, but the scheduled-job
+	// infrastructure runs end to end so enabling it is a config flip once
+	// that invoker lands.
+	canaryJob := scheduler.NewCanaryJob(
+		scheduler.CanaryConfig{
+			Enabled:          cfg.Canary().Enabled(),
+			Interval:         cfg.Canary().Interval(),
+			VaultID:          cfg.Canary().VaultID(),
+			Amount:           cfg.Canary().Amount(),
+			LatencyThreshold: cfg.Canary().LatencyThreshold(),
+		},
+		stubCanaryInvoker{},
+		appMetrics,
+		baseLogger.WithGroup("canary"),
+	)
+	canaryJob.SetLeaderChecker(schedulerLeadership)
+	canaryCtx, cancelCanary := context.WithCancel(context.Background())
+	defer cancelCanary()
+	go canaryJob.Run(canaryCtx)
+
 	jobWorker := jobqueue.NewWorker(
 		jobQueueRepo,
 		jobqueue.Config{
@@ -1786,6 +1846,33 @@ func run() error {
 		baseLogger.Error("failed to register balance reconcile age collector", "error", err)
 	}
 	go balanceReconciler.Run(shutdownCtx)
+
+	// Stellar operational account reserve monitoring (nester#1392): poll the
+	// operator's native XLM balance from Horizon on a fixed interval and
+	// expose it as a scrape-time series (freshness-collector pattern) so
+	// monitoring/alerts/stellar_reserve.yml can page before the account runs
+	// dry of the reserve it needs for trustlines/sponsorships.
+	if operatorAddress := cfg.Stellar().OperatorAddress(); operatorAddress != "" {
+		safeReserveXLM := 5.0
+		if v := os.Getenv("STELLAR_OPERATIONAL_ACCOUNT_SAFE_RESERVE_XLM"); v != "" {
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 0 {
+				safeReserveXLM = parsed
+			}
+		}
+		reserveMonitor := stellarpkg.NewAccountReserveSampler(
+			&http.Client{Timeout: 10 * time.Second},
+			cfg.Stellar().HorizonURL(),
+			operatorAddress,
+			safeReserveXLM,
+			baseLogger.WithGroup("stellar-reserve-monitor"),
+		)
+		if err := appMetrics.RegisterStellarAccountReserve("operator", reserveMonitor.Sample); err != nil {
+			baseLogger.Error("failed to register stellar account reserve collector", "error", err)
+		}
+		go reserveMonitor.Run(shutdownCtx, time.Minute)
+	} else {
+		baseLogger.Warn("STELLAR_OPERATOR_ADDRESS unset: stellar account reserve monitoring disabled")
+	}
 
 	// Balance-freshness SLI (nester#1056, nester#1088): the indexer samples
 	// its own position against the network tip on every tick and publishes it
@@ -2561,10 +2648,38 @@ func (a *reconciliationVaultListerAdapter) ListActiveForReconciliation(ctx conte
 	return out, nil
 }
 
+// flagAuditAdapter adapts service.AuditLogger to flags.AuditRecorder so
+// every feature-flag change (including flips of the mainnet deposit
+// allowlist) is traceable through the platform's existing audit log.
+type flagAuditAdapter struct {
+	logger service.AuditLogger
+}
+
+func (a flagAuditAdapter) RecordFlagChange(ctx context.Context, actor, name string, before, after *flags.Flag) error {
+	return a.logger.Log(ctx, service.AuditEntry{
+		Action:     "flag.change",
+		EntityType: "feature_flag",
+		OldValue:   before,
+		NewValue:   after,
+	})
+}
+
+// stubCanaryInvoker is a placeholder scheduler.CanaryInvoker. It keeps the
+// canary job's scheduling/leader-election/metrics infrastructure running
+// end to end without touching the chain. It must be replaced with an
+// implementation that performs a real deposit/withdraw round trip against
+// the configured canary vault before CANARY_ENABLED is turned on for a
+// mainnet environment (nester#1390 follow-up).
+type stubCanaryInvoker struct{}
+
+func (stubCanaryInvoker) CanaryDeposit(ctx context.Context, vaultID uuid.UUID, amount string) (string, error) {
+	return "", fmt.Errorf("canary: no real invoker configured (stubCanaryInvoker); see nester#1390 follow-up")
+}
+
+func (stubCanaryInvoker) CanaryWithdraw(ctx context.Context, vaultID uuid.UUID, txHash string) (string, error) {
+	return "", fmt.Errorf("canary: no real invoker configured (stubCanaryInvoker); see nester#1390 follow-up")
+}
+
 func ledgerDomainConfig() ledger.ReconciliationConfig {
-	return ledger.ReconciliationConfig{
-		Enabled:          true,
-		Interval:         5 * time.Minute,
-		ToleranceStroops: 1_000_000, // 0.1 USDC
-	}
+	return scheduler.LedgerReconciliationConfigFromEnv(true, 5*time.Minute, 1_000_000) // 0.1 USDC tolerance
 }
