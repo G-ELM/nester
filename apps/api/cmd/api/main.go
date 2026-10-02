@@ -2106,6 +2106,17 @@ func run() error {
 		postgres.NewMoneyPathSwitchRepository(db), auditLogger)
 	vaultService.SetMoneyPathSwitches(moneyPathSwitchService)
 
+	// Per-vault pause switches (#1322): the global switches above stop an
+	// operation everywhere, which is too blunt when one vault is misbehaving.
+	// These scope the same control to one vault, and are exposed through the
+	// admin handler so an operator can pause it without a full system halt.
+	// Wired the same way (setter, optional) so services built for tests keep
+	// working unchanged.
+	vaultMoneyPathSwitchService := service.NewVaultMoneyPathSwitchService(
+		postgres.NewVaultMoneyPathSwitchRepository(db), auditLogger)
+	vaultService.SetVaultMoneyPathSwitches(vaultMoneyPathSwitchService)
+	adminHandler.SetVaultMoneyPathSwitches(vaultMoneyPathSwitchService)
+
 	activityEventRepo := postgres.NewActivityEventRepository(db)
 	nudgeHistoryRepo := postgres.NewNudgeHistoryRepository(db)
 	nudgeOutcomeService := service.NewNudgeOutcomeService(nudgeHistoryRepo)
