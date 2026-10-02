@@ -615,6 +615,17 @@ jobs:
             exit 1
           fi
 
+      # Compile-only: the fuzz crate targets vault-contract's public
+      # conversion module directly (see fuzz/fuzz_targets/conversion_math.rs)
+      # and isn't a member of this workspace (nester#1350), so nothing above
+      # would otherwise catch it silently bitrotting if that module's API
+      # changes. The actual randomized run happens in the nightly workflow,
+      # where minutes-long fuzzing time is acceptable; this just proves it
+      # still builds on every PR.
+      - name: Check vault-contract fuzz target compiles
+        working-directory: packages/contracts/contracts/vault/fuzz
+        run: cargo check --bin conversion_math
+
   sbom:
     name: SBOM Generation
     needs: changes
