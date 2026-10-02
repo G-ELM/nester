@@ -157,9 +157,15 @@ func (s *VaultMoneyPathSwitchService) SetPaused(
 	}
 	reason = strings.TrimSpace(reason)
 
-	previous, err := s.repository.GetVaultSwitch(ctx, vaultID, op)
-	if err != nil {
-		return moneypath.VaultSwitch{}, err
+	// The old state is read only to annotate the audit log. A transient
+	// failure here must not block the write below: during an incident, an
+	// operator trying to pause a vault must not be refused because of an
+	// unrelated read hiccup. If it fails, the audit entry records "unknown"
+	// for the old value instead of returning early.
+	previous, prevErr := s.repository.GetVaultSwitch(ctx, vaultID, op)
+	if prevErr != nil {
+		slog.Default().WarnContext(ctx, "vault money path switch: could not read previous state for audit log; proceeding with write",
+			"vault_id", vaultID.String(), "operation", string(op), "error", prevErr.Error())
 	}
 
 	updated, err := s.repository.SetVaultSwitch(ctx, vaultID, op, paused, reason, actor)
@@ -167,20 +173,26 @@ func (s *VaultMoneyPathSwitchService) SetPaused(
 		return moneypath.VaultSwitch{}, err
 	}
 
-	// Drop the cached value so this instance enforces the new state
-	// immediately rather than after the TTL.
-	s.invalidate(vaultID, op)
+	// Overwrite the cached value with the new state so a concurrent get()
+	// can never repopulate the cache with the stale pre-write value: there
+	// is no gap between "invalidated" and "holds the new value" for a racing
+	// read to land in.
+	s.set(vaultID, op, updated)
 
 	action := "vault_money_path.release"
 	if paused {
 		action = "vault_money_path.pause"
+	}
+	oldValue := map[string]any{"operation": string(op), "paused": "unknown", "reason": "unknown"}
+	if prevErr == nil {
+		oldValue = map[string]any{"operation": string(op), "paused": previous.Paused, "reason": previous.Reason}
 	}
 	_ = s.audit.Log(ctx, AuditEntry{
 		UserID:     actor,
 		Action:     action,
 		EntityType: "vault_money_path_switch",
 		EntityID:   vaultID,
-		OldValue:   map[string]any{"operation": string(op), "paused": previous.Paused, "reason": previous.Reason},
+		OldValue:   oldValue,
 		NewValue:   map[string]any{"operation": string(op), "paused": updated.Paused, "reason": updated.Reason},
 		IPAddress:  ipAddress,
 	})
@@ -210,8 +222,15 @@ func (s *VaultMoneyPathSwitchService) get(ctx context.Context, vaultID uuid.UUID
 	return state, nil
 }
 
-func (s *VaultMoneyPathSwitchService) invalidate(vaultID uuid.UUID, op moneypath.Operation) {
+// set writes value directly into the cache under the full TTL, used after a
+// write so the new state is what any concurrent or subsequent get() sees.
+// Writing the new value rather than deleting the entry closes the race where
+// a concurrent get() that already read the stale pre-write row from the
+// repository would otherwise repopulate the cache with that stale value
+// after a plain invalidation.
+func (s *VaultMoneyPathSwitchService) set(vaultID uuid.UUID, op moneypath.Operation, value moneypath.VaultSwitch) {
+	key := moneypath.VaultSwitchKey{VaultID: vaultID, Operation: op}
 	s.mu.Lock()
-	delete(s.cache, moneypath.VaultSwitchKey{VaultID: vaultID, Operation: op})
+	s.cache[key] = cachedVaultSwitch{value: value, expiresAt: s.nowFn().Add(vaultSwitchCacheTTL)}
 	s.mu.Unlock()
 }

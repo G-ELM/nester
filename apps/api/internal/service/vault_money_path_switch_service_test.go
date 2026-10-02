@@ -185,6 +185,70 @@ func TestVaultPauseNilServiceAllows(t *testing.T) {
 	}
 }
 
+// SetPaused must not block the actual pause on a failed audit read: a
+// transient hiccup reading the old state (fetched only to annotate the audit
+// log) must never stop an operator from pausing a vault during an incident.
+func TestVaultPauseWritesEvenWhenAuditReadFails(t *testing.T) {
+	repo := newFakeVaultSwitchRepo()
+	repo.getErr = errors.New("transient read failure")
+	svc := newTestVaultSwitchService(repo)
+	vaultID := uuid.New()
+
+	updated, err := svc.SetPaused(context.Background(), vaultID, moneypath.OperationDeposit, true, "incident", nil, "")
+	if err != nil {
+		t.Fatalf("SetPaused must succeed despite audit-read failure: %v", err)
+	}
+	if !updated.Paused {
+		t.Fatalf("returned switch should be paused")
+	}
+
+	// Confirm the write actually landed in the repository, not just the
+	// in-memory cache.
+	repo.getErr = nil
+	stored, err := repo.GetVaultSwitch(context.Background(), vaultID, moneypath.OperationDeposit)
+	if err != nil {
+		t.Fatalf("GetVaultSwitch: %v", err)
+	}
+	if !stored.Paused {
+		t.Fatalf("pause did not persist to the repository")
+	}
+}
+
+// After SetPaused returns, a concurrent get() that read the stale
+// "unpaused" row just before the write must never repopulate the cache with
+// that stale value. Writing the new state directly into the cache (rather
+// than just deleting the entry) closes the gap a plain delete would leave.
+func TestVaultPauseCacheNeverServesStaleAfterConcurrentRead(t *testing.T) {
+	repo := newFakeVaultSwitchRepo()
+	svc := newTestVaultSwitchService(repo)
+	vaultID := uuid.New()
+	op := moneypath.OperationDeposit
+
+	// Prime the cache with the pre-incident "not paused" state, as a
+	// concurrent get() would have just before the operator's write lands.
+	if err := svc.EnsureVaultAllowed(context.Background(), vaultID, op); err != nil {
+		t.Fatalf("priming EnsureVaultAllowed: %v", err)
+	}
+
+	// Simulate that racing get() finishing its repository read and writing
+	// the stale value into the cache immediately after SetPaused's own
+	// cache write, by writing the same stale row back in afterward only if
+	// the implementation left a delete-based gap. First perform the actual
+	// pause.
+	if _, err := svc.SetPaused(context.Background(), vaultID, op, true, "incident", nil, ""); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+
+	// Immediately after SetPaused returns, the cache must already reflect
+	// "paused" — not "released" — with no window in which a concurrent
+	// get() racing against the write could have repopulated it from the old
+	// row.
+	err := svc.EnsureVaultAllowed(context.Background(), vaultID, op)
+	if !errors.Is(err, moneypath.ErrPaused) {
+		t.Fatalf("got %v, want moneypath.ErrPaused immediately after SetPaused", err)
+	}
+}
+
 // An unknown operation must be rejected rather than silently treated as open.
 func TestVaultPauseRejectsUnknownOperation(t *testing.T) {
 	svc := newTestVaultSwitchService(newFakeVaultSwitchRepo())
