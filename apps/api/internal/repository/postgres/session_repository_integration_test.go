@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -13,6 +15,17 @@ import (
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+// hashOpaqueToken mirrors service.hashOpaqueToken (unexported, package
+// service) so test fixtures here hash refresh tokens exactly the way the
+// real session repository does in production. Duplicated rather than
+// exported from service: this is a test-fixture concern specific to
+// constructing valid-looking rows, not something production code elsewhere
+// in this package needs.
+func hashOpaqueToken(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
 
 // seedSession inserts a session row and its first refresh token, returning
 // both. absLifetime controls how far in the future AbsoluteExpiresAt is set;
